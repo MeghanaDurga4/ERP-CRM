@@ -231,10 +231,16 @@ export class ChallansService {
    * 6. Set status = Confirmed, confirmedAt = now.
    */
   async confirm(id: string, userId: string) {
-    return this.prisma.$transaction(async (tx) => {
-      // 1. Lock the Challan row itself with FOR UPDATE to guarantee status check atomicity under concurrency
+  return this.prisma.$transaction(
+    async (tx) => {
+      // 1. Lock challan row
       const lockedChallans: Array<{ id: string; status: ChallanStatus }> =
-        await tx.$queryRaw`SELECT id, status FROM "Challan" WHERE id = ${id} FOR UPDATE`;
+        await tx.$queryRaw`
+          SELECT id, status 
+          FROM "Challan" 
+          WHERE id = ${id} 
+          FOR UPDATE
+        `;
 
       if (!lockedChallans || lockedChallans.length === 0) {
         throw new NotFoundException('Challan not found');
@@ -248,43 +254,71 @@ export class ChallansService {
 
       const challan = await tx.challan.findUnique({
         where: { id },
-        include: { items: true, customer: true },
+        include: {
+          items: true,
+          customer: true,
+        },
       });
 
       if (!challan || !challan.items || challan.items.length === 0) {
-        throw new BadRequestException('Cannot confirm a challan with no line items.');
+        throw new BadRequestException(
+          'Cannot confirm a challan with no line items.'
+        );
       }
 
-      // 2. Deduct stock for each line item with ROW-LEVEL LOCKING
+
+      // 2. Deduct stock
       for (const item of challan.items) {
+
         if (!item.productId) {
-          throw new BadRequestException(`Line item '${item.productNameSnapshot}' is missing product reference.`);
-        }
-
-        const lockedProducts: Array<{ id: string; currentStock: number; name: string; sku: string }> =
-          await tx.$queryRaw`SELECT id, "currentStock", name, sku FROM "Product" WHERE id = ${item.productId} AND "deletedAt" IS NULL FOR UPDATE`;
-
-        if (!lockedProducts || lockedProducts.length === 0) {
-          throw new NotFoundException(`Product '${item.productNameSnapshot}' (SKU: ${item.skuSnapshot}) not found or deleted.`);
-        }
-
-        const product = lockedProducts[0];
-
-        if (product.currentStock < item.quantity) {
           throw new BadRequestException(
-            `Insufficient stock for SKU ${item.skuSnapshot} (${item.productNameSnapshot}). Available: ${product.currentStock}, Requested: ${item.quantity}`
+            `Line item '${item.productNameSnapshot}' is missing product reference.`
           );
         }
 
-        const newStock = product.currentStock - item.quantity;
 
-        // Update product stock
+        const lockedProducts: Array<{
+          id: string;
+          currentStock: number;
+          name: string;
+          sku: string;
+        }> =
+          await tx.$queryRaw`
+            SELECT id, "currentStock", name, sku 
+            FROM "Product"
+            WHERE id = ${item.productId}
+            AND "deletedAt" IS NULL
+            FOR UPDATE
+          `;
+
+
+        if (!lockedProducts || lockedProducts.length === 0) {
+          throw new NotFoundException(
+            `Product '${item.productNameSnapshot}' not found.`
+          );
+        }
+
+
+        const product = lockedProducts[0];
+
+
+        if (product.currentStock < item.quantity) {
+          throw new BadRequestException(
+            `Insufficient stock for ${product.name}. Available ${product.currentStock}, Requested ${item.quantity}`
+          );
+        }
+
+
         await tx.product.update({
-          where: { id: item.productId },
-          data: { currentStock: newStock },
+          where: {
+            id: item.productId,
+          },
+          data: {
+            currentStock: product.currentStock - item.quantity,
+          },
         });
 
-        // Write append-only StockMovement record
+
         await tx.stockMovement.create({
           data: {
             productId: item.productId,
@@ -298,45 +332,100 @@ export class ChallansService {
         });
       }
 
-      // 3. Generate gapless Challan Number using atomic ChallanSequence table locked FOR UPDATE
+
+
+      // 3. Generate challan number
       const now = new Date();
-      const yearMonth = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+      const yearMonth =
+        `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
+
       const prefix = `CH-${yearMonth}-`;
 
-      const sequenceLock: Array<{ yearMonth: string; lastValue: number }> =
-        await tx.$queryRaw`SELECT "yearMonth", "lastValue" FROM "ChallanSequence" WHERE "yearMonth" = ${yearMonth} FOR UPDATE`;
+
+      const sequenceLock: Array<{
+        yearMonth: string;
+        lastValue: number;
+      }> =
+        await tx.$queryRaw`
+          SELECT "yearMonth", "lastValue"
+          FROM "ChallanSequence"
+          WHERE "yearMonth" = ${yearMonth}
+          FOR UPDATE
+        `;
+
 
       let nextSeq = 1;
+
+
       if (!sequenceLock || sequenceLock.length === 0) {
-        // Look up max existing challan number for this prefix to prevent collision with seeded challans
+
         const existingMax = await tx.challan.findFirst({
-          where: { challanNumber: { startsWith: prefix } },
-          orderBy: { challanNumber: 'desc' },
+          where: {
+            challanNumber: {
+              startsWith: prefix,
+            },
+          },
+          orderBy: {
+            challanNumber: 'desc',
+          },
         });
-        if (existingMax && existingMax.challanNumber) {
+
+
+        if (existingMax?.challanNumber) {
+
           const parts = existingMax.challanNumber.split('-');
+
           if (parts.length === 3) {
             const lastNum = parseInt(parts[2], 10);
-            if (!isNaN(lastNum)) nextSeq = lastNum + 1;
+
+            if (!isNaN(lastNum)) {
+              nextSeq = lastNum + 1;
+            }
           }
         }
-        await tx.$executeRaw`INSERT INTO "ChallanSequence" ("yearMonth", "lastValue") VALUES (${yearMonth}, ${nextSeq})`;
+
+
+        await tx.$executeRaw`
+          INSERT INTO "ChallanSequence"
+          ("yearMonth","lastValue")
+          VALUES (${yearMonth},${nextSeq})
+        `;
+
       } else {
+
         nextSeq = sequenceLock[0].lastValue + 1;
-        await tx.$executeRaw`UPDATE "ChallanSequence" SET "lastValue" = ${nextSeq} WHERE "yearMonth" = ${yearMonth}`;
+
+
+        await tx.$executeRaw`
+          UPDATE "ChallanSequence"
+          SET "lastValue"=${nextSeq}
+          WHERE "yearMonth"=${yearMonth}
+        `;
       }
 
-      const challanNumber = `${prefix}${String(nextSeq).padStart(6, '0')}`;
 
-      // Update movement reasons with final challan number
+      const challanNumber =
+        `${prefix}${String(nextSeq).padStart(6, '0')}`;
+
+
+
       await tx.stockMovement.updateMany({
-        where: { referenceId: challan.id },
-        data: { reason: `Challan Confirmed: ${challanNumber}` },
+        where: {
+          referenceId: challan.id,
+        },
+        data: {
+          reason: `Challan Confirmed: ${challanNumber}`,
+        },
       });
 
-      // Mark challan confirmed
-      const confirmedChallan = await tx.challan.update({
-        where: { id },
+
+
+      // 4. Update challan
+      return tx.challan.update({
+        where: {
+          id,
+        },
         data: {
           challanNumber,
           status: ChallanStatus.Confirmed,
@@ -345,13 +434,22 @@ export class ChallansService {
         include: {
           customer: true,
           items: true,
-          createdBy: { select: { id: true, name: true } },
+          createdBy: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
         },
       });
 
-      return confirmedChallan;
-    });
-  }
+    },
+    {
+      timeout: 15000,
+      maxWait: 5000,
+    }
+  );
+}
 
   /**
    * CANCEL A CHALLAN
